@@ -37,6 +37,8 @@ class PRTouchCFG:
         self.check_bed_mesh_max_err = config.getfloat('check_bed_mesh_max_err', default=0.2, minval=0.01, maxval=1)
         self.wipe_retract_distance = config.getfloat('wipe_retract_distance', default=0, minval=0, maxval=50)
         self.probe_name = config.get('probe_name', default='bltouch')
+        self.max_probe_retries = config.getint('max_probe_retries', default=3, minval=1, maxval=10)
+        self.max_accuracy_failures = config.getint('max_accuracy_failures', default=3, minval=1, maxval=10)
 
         self.stored_profs = config.get_prefix_sections('prtouch')
         self.stored_profs = self.stored_profs[1] if (len(self.stored_profs) == 2) else None
@@ -170,9 +172,9 @@ class PRTouchZOffsetWrapper:
         for i in range(len(vals_p)):
             vals_p[i] = (i - 0) * sin_angle + (vals_p[i] - 0) * cos_angle + 0
         self.val.out_index = vals_p.index(min(vals_p))
-        if(self.val.out_index > 0):
+        if self.val.out_index > 0:
             for i in range(self.val.out_index, self.cfg.pi_count):
-                fit_vals_t[self.val.out_index] = fit_vals_t[self.val.out_index] * (self.obj.filter.lft_k1_oft / 2) + fit_vals_t[self.val.out_index - 1] * (1 - (self.obj.filter.lft_k1_oft / 2))
+                fit_vals_t[i] = fit_vals_t[i] * (self.obj.filter.lft_k1_oft / 2) + fit_vals_t[i - 1] * (1 - (self.obj.filter.lft_k1_oft / 2))
         vals_p = [x for x in fit_vals_t]
 
         if not (fit_vals_t[-1] > fit_vals_t[-2] > fit_vals_t[-3]):
@@ -182,10 +184,13 @@ class PRTouchZOffsetWrapper:
             return False
         max_val = max(fit_vals_t)
         min_val = min(fit_vals_t)
+        if max_val == min_val:
+            return False
         for i in range(0, self.cfg.pi_count):
             fit_vals_t[i] = (fit_vals_t[i] - min_val) / (max_val - min_val)
         for i in range(0, self.cfg.pi_count - 1):
-            if (fit_vals_t[-1] - fit_vals_t[i]) / ((self.cfg.pi_count - i) * 1. / self.cfg.pi_count) < 0.8:
+            denominator = ((self.cfg.pi_count - i) * 1. / self.cfg.pi_count)
+            if denominator > 0 and (fit_vals_t[-1] - fit_vals_t[i]) / denominator < 0.8:
                 return False
         if fit_vals[-1] < min_hold or fit_vals[-2] < (min_hold / 2) or fit_vals[-3] < (min_hold / 3):
             return False
@@ -241,24 +246,49 @@ class PRTouchZOffsetWrapper:
         pass
 
     def _probe_times(self, max_times, rdy_pos, speed_mm, min_dis_mm, max_z_err, min_hold, max_hold):
-        o_mm = 0
+        self.pnt_msg('=== PROBE_TIMES START: max_times=%d, speed=%.2f, rdy_pos=(%.2f,%.2f,%.2f)'
+                    % (max_times, speed_mm, rdy_pos[0], rdy_pos[1], rdy_pos[2]))
         rdy_pos_z = rdy_pos[2]
         now_pos = self.obj.toolhead.get_position()
-        self._move(now_pos[:2] + [rdy_pos[2]], self.cfg.g29_rdy_speed)        
+        self._move(now_pos[:2] + [rdy_pos[2]], self.cfg.g29_rdy_speed)
         self._move(rdy_pos, self.cfg.g29_xy_speed)
+        o_mm = 0
         for i in range(max_times):
-            o_index0, o_mm0, deal_sta = self.probe_by_step(rdy_pos[:2] + [rdy_pos_z], speed_mm, min_dis_mm, min_hold, max_hold, True)
-            if not deal_sta and rdy_pos_z == rdy_pos[2]:
-                rdy_pos_z += 2
-                continue
-            o_index1, o_mm1, deal_sta = self.probe_by_step(rdy_pos[:2] + [rdy_pos_z], speed_mm, min_dis_mm, min_hold, max_hold, True)
+            o_index0, o_mm0, deal_sta0 = self.probe_by_step(
+                rdy_pos[:2] + [rdy_pos_z], speed_mm, min_dis_mm,
+                min_hold, max_hold, True)
+            if not deal_sta0:
+                if rdy_pos_z == rdy_pos[2]:
+                    rdy_pos_z += 2
+                    continue
+                raise self.obj.printer.command_error(
+                    "PRTouch: First probe failed at %.2f, %.2f"
+                    % (rdy_pos[0], rdy_pos[1]))
+
+            o_index1, o_mm1, deal_sta1 = self.probe_by_step(
+                rdy_pos[:2] + [rdy_pos_z], speed_mm, min_dis_mm,
+                min_hold, max_hold, True)
+            if not deal_sta1:
+                raise self.obj.printer.command_error(
+                    "PRTouch: Second probe failed at %.2f, %.2f"
+                    % (rdy_pos[0], rdy_pos[1]))
+
             o_mm = (o_mm0 + o_mm1) / 2
-            if math.fabs(o_mm0 - o_mm1) <= max_z_err or not self.ck_sys_sta():
-                break
+            if math.fabs(o_mm0 - o_mm1) <= max_z_err:
+                self.pnt_msg('=== PROBE_TIMES END: o_mm=%.3f, attempts=%d, re_probe_cnt=%d'
+                            % (o_mm, i+1, self.val.re_probe_cnt))
+                return o_mm
+            if not self.ck_sys_sta():
+                raise self.obj.printer.command_error(
+                    "PRTouch: System not ready during probing")
+
             self.val.re_probe_cnt += 1
-            self.pnt_msg('***_probe_times must be reprobe= o_mm0=%.2f, o_mm1=%.2f' % (o_mm0, o_mm1))
-        return o_mm
-    
+            self.pnt_msg('***_probe_times must be reprobe= o_mm0=%.2f, o_mm1=%.2f'
+                         % (o_mm0, o_mm1))
+        raise self.obj.printer.command_error(
+            "PRTouch: Failed to converge after %d retries. Range: %.3f"
+            % (max_times, math.fabs(o_mm0 - o_mm1)))
+
     def clear_nozzle(self, hot_min_temp, hot_max_temp, bed_max_temp, min_hold, max_hold):
         min_x, min_y = self.cfg.clr_noz_start_x, self.cfg.clr_noz_start_y
         max_x, max_y = self.cfg.clr_noz_start_x + self.cfg.clr_noz_len_x, self.cfg.clr_noz_start_y + self.cfg.clr_noz_len_y
@@ -270,9 +300,9 @@ class PRTouchZOffsetWrapper:
         src_pos = [min_x, min_y, self.cfg.bed_max_err + 1, cur_pos[3]]
         end_pos = [max_x, max_y, src_pos[2], src_pos[3]]
         self._set_hot_temps(temp=hot_min_temp, fan_spd=0, wait=True, err=10)   
-        src_pos[2] = self._probe_times(3, [src_pos[0], src_pos[1], src_pos[2]], self.cfg.probe_speed, 10, 0.2, min_hold, max_hold)
+        src_pos[2] = self._probe_times(self.cfg.max_probe_retries, [src_pos[0], src_pos[1], src_pos[2]], self.cfg.probe_speed, 10, 0.2, min_hold, max_hold)
         self._set_hot_temps(temp=hot_min_temp + 40, fan_spd=0, wait=False, err=10)
-        end_pos[2] = self._probe_times(3, [end_pos[0], end_pos[1], end_pos[2]], self.cfg.probe_speed, 10, 0.2, min_hold, max_hold)     
+        end_pos[2] = self._probe_times(self.cfg.max_probe_retries, [end_pos[0], end_pos[1], end_pos[2]], self.cfg.probe_speed, 10, 0.2, min_hold, max_hold)     
         self._move(src_pos[:2] + [self.cfg.bed_max_err + 1], self.cfg.g29_xy_speed) 
         self._move(src_pos[:2] + [src_pos[2] + 0.1], self.cfg.g29_rdy_speed) 
         self._set_hot_temps(temp=hot_max_temp, fan_spd=0, wait=True, err=10)
@@ -294,8 +324,15 @@ class PRTouchZOffsetWrapper:
 
     def probe_z_offset(self, x, y):
         self._ck_g28ed()
-        z_offset = self._probe_times(3, [x, y, self.cfg.bed_max_err + 1.], self.cfg.probe_speed, 10, self.cfg.check_bed_mesh_max_err, self.cfg.min_hold, self.cfg.max_hold)
+        z_offset = self._probe_times(self.cfg.max_probe_retries, [x, y, self.cfg.bed_max_err + 1.], self.cfg.probe_speed, 10, self.cfg.check_bed_mesh_max_err, self.cfg.min_hold, self.cfg.max_hold)
         return z_offset
+
+    def _validate_step_dist(self):
+        step_dist = self.obj.dirzctl.steppers[0].get_step_dist()
+        if step_dist <= 0 or step_dist > 1.0:
+            raise self.obj.printer.command_error(
+                "Invalid step_dist value: %.6f. Check stepper configuration." % step_dist)
+        return step_dist
 
     def _cal_min_z(self, start_z, hx711_vals):
         hx711_params, hx711_start_tick = self.obj.hx711s.get_params()
@@ -308,10 +345,12 @@ class PRTouchZOffsetWrapper:
         del hx711_params[0:(len(hx711_params) - self.cfg.pi_count)]
 
         vals_p = [x for x in hx711_vals]
+        if not vals_p:
+            raise self.obj.printer.command_error("No valid sensor data received during probing")
         max_val = max(vals_p)
         min_val = min(vals_p)
         for i in range(len(vals_p)):
-            vals_p[i] = (vals_p[i] - min_val) / (max_val - min_val)
+            vals_p[i] = (vals_p[i] - min_val) / (max_val - min_val) if max_val != min_val else 0
         angle = math.atan((vals_p[-1] - vals_p[0]) / len(vals_p))
         sin_angle = math.sin(-angle)
         cos_angle = math.cos(-angle)
@@ -319,16 +358,24 @@ class PRTouchZOffsetWrapper:
             vals_p[i] = (i - 0) * sin_angle + (vals_p[i] - 0) * cos_angle + 0
         self.val.out_index = vals_p.index(min(vals_p))
 
-        dirzctl_params[0]['tick'] = (dirzctl_params[0]['tick'] - dirzctl_start_tick) / self.obj.dirzctl.mcu_freq
-        dirzctl_params[1]['tick'] = ((4294967296 if dirzctl_params[1]['tick'] < dirzctl_start_tick else 0) + dirzctl_params[1]['tick'] - dirzctl_start_tick) / self.obj.dirzctl.mcu_freq
+        mcu = self.obj.dirzctl.mcu
+        dirzctl_time_0 = mcu.clock_to_print_time(mcu.clock32_to_clock64(dirzctl_params[0]['tick']))
+        dirzctl_time_1 = mcu.clock_to_print_time(mcu.clock32_to_clock64(dirzctl_params[1]['tick']))
+        
+        step_dist = self._validate_step_dist()
+        step_value = step_dist * self.obj.dirzctl.step_base
+        
         dirzctl_params[0]['z'] = start_z
-        dirzctl_params[1]['z'] = start_z - (dirzctl_params[0]['step'] - dirzctl_params[1]['step'] + 1) * (self.obj.dirzctl.steppers[0].get_step_dist() * self.obj.dirzctl.step_base)
-        tick_p = ((4294967296 if hx711_params[self.val.out_index]['nt'] < hx711_start_tick else 0) + hx711_params[self.val.out_index]['nt'] - hx711_start_tick) / self.obj.hx711s.mcu_freq
-        self.val.out_val_mm = self._get_linear2([dirzctl_params[0]['tick'], 0, dirzctl_params[0]['z']], [dirzctl_params[1]['tick'], 0, dirzctl_params[1]['z']], [tick_p, 0, 0], True)[2]
+        dirzctl_params[1]['z'] = start_z - (dirzctl_params[0]['step'] - dirzctl_params[1]['step'] + 1) * step_value
+        
+        hx711_mcu = self.obj.hx711s.mcu
+        tick_p = hx711_mcu.clock_to_print_time(hx711_mcu.clock32_to_clock64(hx711_params[self.val.out_index]['nt']))
+        
+        self.val.out_val_mm = self._get_linear2([dirzctl_time_0, 0, dirzctl_params[0]['z']], [dirzctl_time_1, 0, dirzctl_params[1]['z']], [tick_p, 0, 0], True)[2]
         self.pnt_msg('call_min_z, re_probe_cnt=%d, out_index=%d, out_val_mm=%.2f' % (self.val.re_probe_cnt, self.val.out_index, self.val.out_val_mm))
-        up_min_cnt = int((self.val.out_val_mm - dirzctl_params[1]['z']) / (self.obj.dirzctl.steppers[0].get_step_dist() * self.obj.dirzctl.step_base))
+        up_min_cnt = int((self.val.out_val_mm - dirzctl_params[1]['z']) / step_value)
         up_all_cnt = dirzctl_params[0]['step'] - dirzctl_params[1]['step'] + 1
-        limt_up_cnt = int(10 / (self.obj.dirzctl.steppers[0].get_step_dist() * self.obj.dirzctl.step_base))
+        limt_up_cnt = int(10 / step_value)
         up_min_cnt = up_min_cnt if up_min_cnt < limt_up_cnt else limt_up_cnt  
         up_all_cnt = up_all_cnt if up_all_cnt < limt_up_cnt else limt_up_cnt
         return (up_min_cnt if up_min_cnt >= 0 else 0), up_all_cnt, True
@@ -337,7 +384,9 @@ class PRTouchZOffsetWrapper:
         self.obj.hx711s.read_base(int(self.cfg.base_count / 2), max_hold)
         step_cnt = int(min_dis_mm / (self.obj.dirzctl.steppers[0].get_step_dist() * self.obj.dirzctl.step_base))
         step_us = int(((min_dis_mm / speed_mm) * 1000 * 1000) / step_cnt)
-        self.obj.hx711s.query_start(self.cfg.pi_count * 2, int(65535), del_dirty=True, show_msg=False, is_ck_con=True)        
+        self.pnt_msg('>>> PROBE_BY_STEP: pos=(%.2f,%.2f,%.2f) speed=%.2f step_us=%d step_cnt=%d'
+                    % (rdy_pos[0], rdy_pos[1], rdy_pos[2], speed_mm, step_us, step_cnt))
+        self.obj.hx711s.query_start(self.cfg.pi_count * 2, int(65535), del_dirty=True, show_msg=False, is_ck_con=True)
         self.obj.dirzctl.check_and_run(0, int(step_us), int(step_cnt), wait_finish=False, is_ck_con=True)
         self.obj.hx711s.delay_s(0.015)
         self.pnt_msg('*********************************************************')
@@ -368,9 +417,12 @@ class PRTouchZOffsetWrapper:
                 up_min_cnt, up_all_cnt, deal_sta = self._cal_min_z(rdy_pos[2], tmp_hx711_vs[i])
                 if up_after:
                     self.obj.dirzctl.check_and_run(1, int(step_us / 2), int(up_all_cnt))
+                self.pnt_msg('<<< PROBE_BY_STEP: result=(idx=%d, mm=%.3f, status=%s)'
+                            % (self.val.out_index, self.val.out_val_mm, deal_sta))
                 return self.val.out_index, self.val.out_val_mm, deal_sta
             self.obj.hx711s.delay_s(0.005)
-        return self.val.out_index, self.val.out_val_mm, True
+        self.pnt_msg('probe_by_step FAILED: system shutdown or timeout detected')
+        return self.val.out_index, self.val.out_val_mm, False
 
     def probe_calibrate_finalize(self, kin_pos):
         if kin_pos is None:
@@ -429,30 +481,52 @@ class PRTouchZOffsetWrapper:
         if gcmd.get_int('APPLY_Z_ADJUST', 0) == 1:
             self.obj.gcode.run_script_from_command('SET_GCODE_OFFSET Z_ADJUST=%f MOVE=1' % (z_adjust))
 
-        z_probe[2] = homing_origin[2] + z_adjust - start_z_offset
-        self.probe_calibrate_finalize(z_probe)
+        z_probe_list = list(z_probe)
+        z_probe_list[2] = homing_origin[2] + z_adjust - start_z_offset
+        self.probe_calibrate_finalize(z_probe_list)
 
     cmd_PRTOUCH_ACCURACY_help = "Probe Z-height accuracy at sensoor position"
     def cmd_PRTOUCH_ACCURACY(self, gcmd):
         self._ck_g28ed()
         speed = gcmd.get_float("PROBE_SPEED", self.cfg.probe_speed, above=0.)
         sample_count = gcmd.get_int("SAMPLES", 10, minval=1)
+        max_failures = gcmd.get_int("MAX_FAILURES", 3, minval=1, maxval=10)
         gcmd.respond_info("PRTOUCH_ACCURACY at X:%.3f Y:%.3f"
-                          " (samples=%d speed=%.1f)\n"
+                          " (samples=%d speed=%.1f max_failures=%d)\n"
                           % (self.cfg.sensor_x, self.cfg.sensor_y,
-                             sample_count, speed))
+                             sample_count, speed, max_failures))
         sensor_pos = [self.cfg.sensor_x, self.cfg.sensor_y, self.cfg.bed_max_err]
         # Move to sensor location
         self._move(sensor_pos, self.cfg.g29_xy_speed)
         # Probe bed sample_count times
         positions = []
+        failed_count = 0
+        total_attempts = 0
         while len(positions) < sample_count:
+            total_attempts += 1
+            if total_attempts > sample_count + max_failures:
+                raise self.obj.printer.command_error(
+                    "Too many probe attempts: %d attempts for %d samples "
+                    "(failed: %d)" % (total_attempts, sample_count, failed_count))
+
             # Probe position
-            _index1, pos, _sta = self.probe_by_step(sensor_pos, speed, 10, self.cfg.min_hold, self.cfg.max_hold, True)
+            _index1, pos, sta = self.probe_by_step(sensor_pos, speed, 10,
+                                                  self.cfg.min_hold,
+                                                  self.cfg.max_hold, True)
+            if not sta:
+                failed_count += 1
+                gcmd.respond_info("probe attempt #%d FAILED (total failures: %d/%d)"
+                                  % (total_attempts, failed_count, max_failures))
+                if failed_count >= max_failures:
+                    raise self.obj.printer.command_error(
+                        "Probe accuracy test failed: %d failures (limit: %d)"
+                        % (failed_count, max_failures))
+                continue
+
             positions.append(pos)
             gcmd.respond_info(
-                "probe #%d at (%.3f, %.3f): %.3f\n"
-                % (len(positions), sensor_pos[0], sensor_pos[1], pos))
+                "probe #%d/%d at (%.3f, %.3f): %.3f\n"
+                % (len(positions), sample_count, sensor_pos[0], sensor_pos[1], pos))
         # Calculate maximum, minimum and average values
         max_value = max(positions)
         min_value = min(positions)
@@ -467,8 +541,10 @@ class PRTouchZOffsetWrapper:
         # Show information
         gcmd.respond_info(
             "probe accuracy results: maximum %.6f, minimum %.6f, range %.6f, "
-            "average %.6f, median %.6f, standard deviation %.6f" % (
-            max_value, min_value, range_value, avg_value, median, sigma))
+            "average %.6f, median %.6f, standard deviation %.6f\n"
+            "total attempts: %d, successful: %d, failed: %d" % (
+            max_value, min_value, range_value, avg_value, median, sigma,
+            total_attempts, len(positions), failed_count))
 
 
 def load_config(config):

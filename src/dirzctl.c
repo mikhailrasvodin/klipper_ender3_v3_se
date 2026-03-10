@@ -170,7 +170,7 @@ dirzctl_task(void)
 
 		if(d->a_finish == 0)
 		{
-			return;
+			continue;
 		}
 
 		sendf("result_dirzctl oid=%c step=%u tick=%u", (uint8_t)d->oid, (uint16_t)d->a_steps, (uint32_t)d->a_ticks);

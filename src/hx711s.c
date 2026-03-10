@@ -20,6 +20,7 @@ struct hx711s
 	uint8_t flags;	
     uint32_t hx711_count;
     int32_t  times_read;
+    uint64_t last_tick;
     struct gpio_out clks[4];
     struct gpio_in sdos[4];
 };
@@ -56,6 +57,7 @@ command_config_hx711s(uint32_t *args)
         shutdown("Max of 4 hx711");
 	h->flags = 0;
 	h->rest_ticks = HX711S_SAMPLE_REST_TICKS;
+    h->last_tick = 0;
 	h->hx711s_timer.func = hx711s_sample_event;
     sendf("debug_hx711s oid=%c arg[0]=%u arg[1]=%u arg[2]=%u arg[3]=%u", (int)args[0], (int)args[0], (int)args[1], 0, 0);
 }
@@ -64,15 +66,14 @@ DECL_COMMAND(command_config_hx711s, "config_hx711s oid=%c hx711_count=%c");
 static int32_t 
 get_hx711s(struct hx711s* h)
 {
-    static uint64_t last_tick = 0;    
     int32_t outVals[4] = {0, 0, 0, 0}, is_data_valid = 0;
 
     for (int j = 0; j < h->hx711_count; j++)
         is_data_valid |= (gpio_in_read(h->sdos[j]) << j);
 
     uint64_t now_tick = timer_read_time();
-    now_tick += (now_tick < last_tick ? 0xFFFFFFFF : 0);
-    uint64_t now_inter_ms = (now_tick - last_tick) * 1000.0f / CONFIG_CLOCK_FREQ;
+    now_tick += (now_tick < h->last_tick ? 0x100000000ULL : 0);
+    uint64_t now_inter_ms = (now_tick - h->last_tick) * 1000 / CONFIG_CLOCK_FREQ;
 
     //if (is_data_valid == 0 || now_inter_ms >= 25)
     if (is_data_valid == 0)
@@ -100,7 +101,7 @@ get_hx711s(struct hx711s* h)
         for (int j = 0; j < h->hx711_count; j++)
             gpio_out_write(h->clks[j], 0);
 
-        last_tick = timer_read_time();
+        h->last_tick = timer_read_time();
         sendf("result_hx711s oid=%c vd=%c it=%c tr=%hu nt=%u v0=%i v1=%i v2=%i v3=%i", 
                              (uint8_t)h->oid, (uint8_t)is_data_valid, (uint8_t)now_inter_ms, (uint16_t)h->times_read, (uint32_t)now_tick,  (int32_t)outVals[0], (int32_t)outVals[1], (int32_t)outVals[2], (int32_t)outVals[3]);
         return 1;  
@@ -156,7 +157,7 @@ hx711s_task(void)
 	{
     	if (!(h->flags & HX711S_SAMPLE_START) || h->times_read <= 0)
         {
-			return;
+			continue;
 		}		
 
     	if(get_hx711s(h) > 0)

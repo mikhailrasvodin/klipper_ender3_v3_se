@@ -7,6 +7,7 @@ from os import remove
 import time
 import mcu
 import math
+import threading
 
 class HX711S:
     def __init__(self, config):
@@ -17,7 +18,7 @@ class HX711S:
         self.del_dirty = False
         self.index_dirty = 0
         self.start_tick = 0
-        self.need_wait = False
+        self.lock = threading.Lock()
         self.s_clk_pin = []
         self.s_sdo_pin = []
         self.all_params = []
@@ -81,51 +82,50 @@ class HX711S:
         pass
 
     def _handle_result_hx711s(self, params):
-        while self.need_wait:
-            self.delay_s(0.001)
-        self.start_tick = self.start_tick if len(self.all_params) != 0 else params['nt']
-        if self.del_dirty and (params['vd'] != 0 or params['it'] > 20) and self.index_dirty == 0:
-            self.index_dirty = 1
-            return
-        self.index_dirty -= 1 if self.index_dirty == 1 else 0
-        self.all_params.append(params)
-        for i in range(self.s_count):
-            self.all_vals[i].append(params['v%d' % i] - self.base_avgs[i])
-        if self.show_msg:
-            self.gcode.respond_info('Hx711 Val=' + str(params))
-        if len(self.all_params) > self.pi_count:
-            del self.all_params[0]
+        with self.lock:
+            self.start_tick = self.start_tick if len(self.all_params) != 0 else params['nt']
+            if self.del_dirty and (params['vd'] != 0 or params['it'] > 20) and self.index_dirty == 0:
+                self.index_dirty = 1
+                return
+            self.index_dirty -= 1 if self.index_dirty == 1 else 0
+            # We keep a copy of params, which includes #receive_time
+            self.all_params.append(dict(params))
             for i in range(self.s_count):
-                del self.all_vals[i][0]
+                self.all_vals[i].append(params['v%d' % i] - self.base_avgs[i])
+            if self.show_msg:
+                self.gcode.respond_info('Hx711 Val=' + str(params))
+            if len(self.all_params) > self.pi_count:
+                del self.all_params[0]
+                for i in range(self.s_count):
+                    del self.all_vals[i][0]
         pass
 
     def query_start(self, pi_count, cycle_count, del_dirty=False, show_msg=False, is_ck_con=False):
         if self.is_shutdown or self.is_timeout:
-            pass
-        if cycle_count != 0:
-            self.pi_count = pi_count
-            self.all_params = []
-            self.all_vals = [[], [], [], []]
-            self.show_msg = show_msg
-            self.del_dirty = del_dirty
-            self.index_dirty = 0
+            raise self.printer.command_error("Cannot run hx711s query: MCU is shutdown or timed out")
+        with self.lock:
+            if cycle_count != 0:
+                self.pi_count = pi_count
+                self.all_params = []
+                self.all_vals = [[], [], [], []]
+                self.show_msg = show_msg
+                self.del_dirty = del_dirty
+                self.index_dirty = 0
         # self.query_cmd.send([self.oid, cycle_count, 1 if is_ck_con else 0])
         self.query_cmd.send([self.oid, cycle_count])
         pass
 
     def get_params(self):
-        self.need_wait = True
-        tmps = [x for x in self.all_params]
-        self.need_wait = False
-        return tmps, self.start_tick
+        with self.lock:
+            tmps = [x for x in self.all_params]
+            return tmps, self.start_tick
 
     def get_vals(self):
-        self.need_wait = True
-        tmps = [[], [], [], []]
-        for i in range(self.s_count):
-            tmps[i] = [x for x in self.all_vals[i]]
-        self.need_wait = False
-        return tmps
+        with self.lock:
+            tmps = [[], [], [], []]
+            for i in range(self.s_count):
+                tmps[i] = [x for x in self.all_vals[i]]
+            return tmps
 
     def delay_s(self, delay_s):
         toolhead = self.printer.lookup_object("toolhead")
@@ -143,6 +143,8 @@ class HX711S:
         pass
 
     def read_base(self, cnt, max_hold, reset_zero=True):
+        self.printer.lookup_object('prtouch').pnt_msg(
+            'HX711S read_base: cnt=%d, max_hold=%d, reset=%s' % (cnt, max_hold, reset_zero))
         avgs = [0, 0, 0, 0]
         rvs = [[], [], [], []]
         for i in range(3):

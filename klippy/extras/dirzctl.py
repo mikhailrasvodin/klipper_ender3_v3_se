@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import mcu
 import time
+import logging
 
 class DirZCtl:
     def __init__(self, config):
@@ -71,7 +72,7 @@ class DirZCtl:
         pass
 
     def _handle_result_dirzctl(self, params):
-        self.all_params.append(params)
+        self.all_params.append(dict(params))
         # self.printer.lookup_object('prtouch').pnt_msg(str(params))
         pass
 
@@ -80,14 +81,27 @@ class DirZCtl:
 
     def check_and_run(self, direct, step_us, step_cnt, wait_finish=True, is_ck_con=False):
         if self.is_shutdown or self.is_timeout:
-            pass
+            raise self.printer.command_error("Cannot run dirzctl: MCU is shutdown or timed out")
         if step_cnt != 0:
             self.all_params = []
         # self.run_cmd.send([self.oid, direct, step_us, step_cnt, 1 if is_ck_con else 0])
         self.run_cmd.send([self.oid, direct, step_us, step_cnt])
         t_start = time.time()
-        while not (self.is_shutdown or self.is_timeout) and wait_finish and ((time.time() - t_start) < (1.5 * 1000 * 1000 * step_us * step_cnt)) and len(self.all_params) != 2:
+        timeout = 1.5 * (step_us * step_cnt / 1000000.0) + 0.5
+        if wait_finish:
+            logging.info("dirzctl: wait_finish=True, timeout=%.3f, "
+                         "step_us=%d, step_cnt=%d",
+                         timeout, step_us, step_cnt)
+        while not (self.is_shutdown or self.is_timeout) and wait_finish and ((time.time() - t_start) < timeout) and len(self.all_params) != 2:
             self.hx711s.delay_s(0.05)
+        if wait_finish:
+            if self.is_shutdown or self.is_timeout:
+                raise self.printer.command_error("dirzctl: MCU shutdown during move")
+            if len(self.all_params) != 2:
+                raise self.printer.command_error(
+                    "dirzctl: Timeout waiting for move to finish "
+                    "(got %d/2 responses, timeout=%.3fs, step_cnt=%d)"
+                    % (len(self.all_params), timeout, step_cnt))
         pass
 
     def send_heart_beat(self):
