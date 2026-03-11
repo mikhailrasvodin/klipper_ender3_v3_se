@@ -339,8 +339,9 @@ class PRTouchZOffsetWrapper:
         dirzctl_params, dirzctl_start_tick = self.obj.dirzctl.get_params()
         if dirzctl_params is None or len(dirzctl_params) != 2:     
             raise self.obj.printer.command_error("""{"code":"key502", "msg":"probe_by_step: Can not recv stepper-z status."}""")
+        
+        up_all_cnt = dirzctl_params[1]['step'] - dirzctl_params[0]['step']
         if len(hx711_vals) < self.cfg.pi_count or len(hx711_params) < self.cfg.pi_count:
-            up_all_cnt = dirzctl_params[0]['step'] - dirzctl_params[1]['step'] + 1
             return up_all_cnt, up_all_cnt, False
         del hx711_params[0:(len(hx711_params) - self.cfg.pi_count)]
 
@@ -365,14 +366,22 @@ class PRTouchZOffsetWrapper:
         step_dist = self._validate_step_dist()
         step_value = step_dist * self.obj.dirzctl.step_base
         
+        # Explicit distance calculation
+        total_steps = abs(dirzctl_params[1]['step'] - dirzctl_params[0]['step'])
+        travel_mm = total_steps * step_value
+        
         dirzctl_params[0]['z'] = start_z
-        dirzctl_params[1]['z'] = start_z - (dirzctl_params[0]['step'] - dirzctl_params[1]['step'] + 1) * step_value
+        dirzctl_params[1]['z'] = start_z - travel_mm
+        
+        self.pnt_msg('call_min_z DEBUG: start_z=%.3f, travel=%.3f, end_z=%.3f, steps=%d' 
+                    % (start_z, travel_mm, dirzctl_params[1]['z'], total_steps))
         
         hx711_mcu = self.obj.hx711s.mcu
         tick_p = hx711_mcu.clock_to_print_time(hx711_mcu.clock32_to_clock64(hx711_params[self.val.out_index]['nt']))
         
         self.val.out_val_mm = self._get_linear2([dirzctl_time_0, 0, dirzctl_params[0]['z']], [dirzctl_time_1, 0, dirzctl_params[1]['z']], [tick_p, 0, 0], True)[2]
-        self.pnt_msg('call_min_z, re_probe_cnt=%d, out_index=%d, out_val_mm=%.2f' % (self.val.re_probe_cnt, self.val.out_index, self.val.out_val_mm))
+        self.pnt_msg('call_min_z: start_z=%.3f, trigger_z=%.3f, probe_z_pos=%.3f' % (start_z, dirzctl_params[1]['z'], self.val.out_val_mm))
+        self.pnt_msg('call_min_z: step_dist=%.6f, step_base=%.1f, total_steps=%d' % (step_dist, self.obj.dirzctl.step_base, dirzctl_params[0]['step'] - dirzctl_params[1]['step']))
         up_min_cnt = int((self.val.out_val_mm - dirzctl_params[1]['z']) / step_value)
         up_all_cnt = dirzctl_params[0]['step'] - dirzctl_params[1]['step'] + 1
         limt_up_cnt = int(10 / step_value)
@@ -465,24 +474,39 @@ class PRTouchZOffsetWrapper:
         probe_x = x - probe_x_offset
         probe_y = y - probe_y_offset
         self.pnt_msg("Checking z-position of probe (%.2f, %.2f)" % (probe_x, probe_y))
+        
+        # Safety Z-hop to ensure BLTouch has room to deploy
+        self.obj.gcode.run_script_from_command('G1 Z10 F600')
+        
         self._move([probe_x, probe_y, self.cfg.bed_max_err + 1.], self.cfg.g29_xy_speed)
         probe_gcmd = self.obj.gcode.create_gcode_command("PROBE", "PROBE", {'SAMPLES': '2'})
         z_probe = probe.run_single_probe(self.obj.probe, probe_gcmd)
         self.pnt_msg('Probe at sensor: %.3f' % z_probe[2])
 
         nozzle_z_offset = self.probe_z_offset(x, y)
-        self.pnt_msg('Nozzle z_offset: %.3f' % nozzle_z_offset)
+        self.pnt_msg('Nozzle touch Z-pos: %.3f' % nozzle_z_offset)
+        self.pnt_msg('Probe trigger Z-pos: %.3f' % z_probe[2])
 
-        z_offset = nozzle_z_offset - z_probe[2]
-        self.pnt_msg('Calculated z_offset: %.3f' % z_offset)
+        # When Z is homed with a probe, the current Z coordinate system is 
+        # already relative to the current start_z_offset.
+        # To find the NEW total offset, we take what we have and apply the 
+        # measured difference between where the nozzle hit and where the probe hits.
+        # Formula: new = old + (probe_trigger_z - nozzle_touch_z)
+        
+        offset_diff = z_probe[2] - nozzle_z_offset
+        new_total_z_offset = start_z_offset + offset_diff
+        
+        self.pnt_msg('Current z_offset: %.3f' % start_z_offset)
+        self.pnt_msg('Measured difference: %.3f' % offset_diff)
+        self.pnt_msg('>>> FINAL CALCULATED Z_OFFSET: %.3f <<<' % new_total_z_offset)
 
-        z_adjust = z_offset + start_z_offset
-        self.pnt_msg('z_adjust: %.3f' % z_adjust)
         if gcmd.get_int('APPLY_Z_ADJUST', 0) == 1:
-            self.obj.gcode.run_script_from_command('SET_GCODE_OFFSET Z_ADJUST=%f MOVE=1' % (z_adjust))
+            # Adjustment is just the difference
+            self.obj.gcode.run_script_from_command('SET_GCODE_OFFSET Z_ADJUST=%f MOVE=1' % (offset_diff))
 
         z_probe_list = list(z_probe)
-        z_probe_list[2] = homing_origin[2] + z_adjust - start_z_offset
+        # Finalizer expects -z_offset to save it as positive z_offset in config
+        z_probe_list[2] = -new_total_z_offset
         self.probe_calibrate_finalize(z_probe_list)
 
     cmd_PRTOUCH_ACCURACY_help = "Probe Z-height accuracy at sensoor position"
