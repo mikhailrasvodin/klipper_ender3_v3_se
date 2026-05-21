@@ -59,6 +59,9 @@ g29_xy_speed: 150            # XY travel speed during bed mesh (default: 150 mm/
 g29_rdy_speed: 2.5           # Z approach speed (default: 2.5 mm/s)
 max_probe_retries: 3         # Maximum retry attempts for probe measurements (default: 3, range: 1-10)
 max_accuracy_failures: 3     # Maximum failures for accuracy tests (default: 3, range: 1-10)
+reference_probe_samples: 1   # BLTouch samples for the reference probe measurement (default: 1)
+reference_probe_retries: 3   # Retry count for BLTouch reference deploy failures (default: 3)
+reference_probe_z: 10        # Z height used before retrying the BLTouch reference probe (default: 10mm)
 
 # Bed mesh validation
 bed_max_err: 4               # Maximum bed error tolerance in mm (default: 4)

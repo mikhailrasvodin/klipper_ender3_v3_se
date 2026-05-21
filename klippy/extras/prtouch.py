@@ -8,7 +8,6 @@ import math
 import random
 import mcu
 import time
-from . import probe
 
 class PRTouchCFG:
     def __init__(self, config):
@@ -39,6 +38,9 @@ class PRTouchCFG:
         self.probe_name = config.get('probe_name', default='bltouch')
         self.max_probe_retries = config.getint('max_probe_retries', default=3, minval=1, maxval=10)
         self.max_accuracy_failures = config.getint('max_accuracy_failures', default=3, minval=1, maxval=10)
+        self.reference_probe_samples = config.getint('reference_probe_samples', default=1, minval=1, maxval=5)
+        self.reference_probe_retries = config.getint('reference_probe_retries', default=3, minval=1, maxval=10)
+        self.reference_probe_z = config.getfloat('reference_probe_z', default=10., minval=1., maxval=50.)
 
         self.stored_profs = config.get_prefix_sections('prtouch')
         self.stored_profs = self.stored_profs[1] if (len(self.stored_profs) == 2) else None
@@ -327,6 +329,61 @@ class PRTouchZOffsetWrapper:
         z_offset = self._probe_times(self.cfg.max_probe_retries, [x, y, self.cfg.bed_max_err + 1.], self.cfg.probe_speed, 10, self.cfg.check_bed_mesh_max_err, self.cfg.min_hold, self.cfg.max_hold)
         return z_offset
 
+    def _recover_reference_probe(self):
+        probe_obj = self.obj.probe
+        if hasattr(probe_obj, 'sync_print_time'):
+            probe_obj.sync_print_time()
+        if hasattr(probe_obj, 'send_cmd'):
+            probe_obj.send_cmd('reset', duration=1.)
+            probe_obj.send_cmd('pin_up',
+                               duration=getattr(probe_obj, 'pin_move_time', 1.))
+        if hasattr(probe_obj, 'sync_print_time'):
+            probe_obj.sync_print_time()
+
+    def _run_single_reference_probe(self, probe_gcmd):
+        probe_session = self.obj.probe.start_probe_session(probe_gcmd)
+        run_error = None
+        try:
+            probe_session.run_probe(probe_gcmd)
+            return probe_session.pull_probed_results()[0]
+        except self.obj.printer.command_error as e:
+            run_error = e
+            raise
+        finally:
+            try:
+                probe_session.end_probe_session()
+            except self.obj.printer.command_error:
+                if run_error is None:
+                    raise
+                logging.exception("Reference probe cleanup")
+
+    def _run_reference_probe(self, gcmd):
+        samples = gcmd.get_int('REFERENCE_PROBE_SAMPLES',
+                               self.cfg.reference_probe_samples,
+                               minval=1, maxval=5)
+        retries = gcmd.get_int('REFERENCE_PROBE_RETRIES',
+                               self.cfg.reference_probe_retries,
+                               minval=1, maxval=10)
+        probe_gcmd = self.obj.gcode.create_gcode_command(
+            "PROBE", "PROBE", {'SAMPLES': str(samples)})
+        last_error = None
+        for retry in range(retries):
+            try:
+                return self._run_single_reference_probe(probe_gcmd)
+            except self.obj.printer.command_error as e:
+                last_error = str(e)
+                if "BLTouch failed to deploy" not in last_error:
+                    raise
+                if retry >= retries - 1:
+                    raise
+                self.pnt_msg("Reference probe failed to deploy; retrying (%d/%d)"
+                             % (retry + 1, retries))
+                self._recover_reference_probe()
+                cur_pos = self.obj.toolhead.get_position()
+                self._move(cur_pos[:2] + [self.cfg.reference_probe_z],
+                           self.cfg.g29_rdy_speed)
+        raise self.obj.printer.command_error(last_error)
+
     def _validate_step_dist(self):
         step_dist = self.obj.dirzctl.steppers[0].get_step_dist()
         if step_dist <= 0 or step_dist > 1.0:
@@ -476,11 +533,11 @@ class PRTouchZOffsetWrapper:
         self.pnt_msg("Checking z-position of probe (%.2f, %.2f)" % (probe_x, probe_y))
         
         # Safety Z-hop to ensure BLTouch has room to deploy
-        self.obj.gcode.run_script_from_command('G1 Z10 F600')
+        self.obj.gcode.run_script_from_command(
+            'G1 Z%.3f F600' % self.cfg.reference_probe_z)
         
         self._move([probe_x, probe_y, self.cfg.bed_max_err + 1.], self.cfg.g29_xy_speed)
-        probe_gcmd = self.obj.gcode.create_gcode_command("PROBE", "PROBE", {'SAMPLES': '2'})
-        z_probe = probe.run_single_probe(self.obj.probe, probe_gcmd)
+        z_probe = self._run_reference_probe(gcmd)
         self.pnt_msg('Probe at sensor: %.3f' % z_probe[2])
 
         nozzle_z_offset = self.probe_z_offset(x, y)
